@@ -1,0 +1,443 @@
+---
+title: "AI in Education vs AI in Creative Arts on Bluesky"
+author: "Group 10: Tserentogtokh Otgonbaatar (22227904) (33%), Victorio Lincardo (22192552) (34%), Cong Vinh (22165158) (33%)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, fig.align = "center")
+```
+
+**Code and data repository:** https://github.com/Rio9491/AI-in-Education-and-Creative-Arts-Grp10.git
+
+# Research Questions
+
+We compare how Bluesky users talk about AI in **Education** and in **Creative Arts**. The four questions are linked, so that each analysis builds on the one before it.
+
+1. **Text analysis:** Which words are most common in each area?
+2. **Hypothesis test:** Are posts about AI in creative arts more likely to be *critical*
+   than posts about AI in education?
+3. **Clustering:** Do posts form natural groups, and do the groups match the two areas
+   or the critical theme?
+4. **Network:** Which accounts are most important in the follow network around the
+   most-followed author in each area, and do the two areas share accounts?
+
+The word analysis (1) shows that the two areas use different vocabulary and hints at a difference in tone, which motivates the test of how critical each area is (2). Clustering (3) checks whether the posts group into themes that follow the areas or the critical tone. The network (4) then looks beyond the text at which accounts sit at the centre of each conversation, and whether the two conversations overlap.
+
+# Data Collection
+
+We used the Bluesky API through the R package `atrrr`. Posts were collected with `search_post()` for the keywords "AI education" (Education area) and "AI art" (Creative area), sorted by latest, with a limit of 1000 posts per keyword. We logged in with a Bluesky app password, which is not stored in the code or the repository. The results were saved to `posts_raw.RData`, so the report can be knitted again without the API. For the network analysis we also collected follow relationships with `get_user_info()` and `get_follows()` (see Network Analysis), saved in `network_edges.RData`.
+
+The code asks for the last 60 days, but because the results are sorted by latest and capped, the posts cover only a short recent period of about 1 week
+
+**Packages:** `atrrr`, `tm`, `wordcloud`, `igraph`.
+**Variables:** for each post, the post ID (`uri`), author handle, text, like count and area (Education or Creative); for the network, account handles, follower counts and who follows whom.
+**Data volume:** 2,186 posts (1,097 Education and 1,089 Creative); the API returned slightly more than the limit of 1000 per keyword. The follow network has 1,844 accounts and 1,947 follow links.
+
+```{r collect}
+library(atrrr)
+library(tm)
+library(wordcloud)
+library(igraph)
+set.seed(3020) # To keep the results identical even after repeated "knit"
+
+# prevents re-querying the Bluesky API on every run
+if (file.exists("posts_raw.RData")) {
+  load("posts_raw.RData")
+} else {
+  # auth(user = "username", password = "password")
+  since = as.character(Sys.Date() - 60)
+  edu = search_post("AI education", sort = "latest", limit = 1000, since = since)
+  art = search_post("AI art",       sort = "latest", limit = 1000, since = since)
+  names(edu)   # make sure names are the same for reference in data frame
+  
+  # combines both data frames
+  posts = rbind(
+    data.frame(uri = edu$uri, handle = tolower(edu$author_handle), text = edu$text,
+               likes = edu$like_count, area = "Education"),
+    data.frame(uri = art$uri, handle = tolower(art$author_handle), text = art$text,
+               likes = art$like_count, area = "Creative"))
+  save(posts, file = "posts_raw.RData")
+}
+# variables and data volume
+dim(posts)
+table(posts$area)
+```
+
+**Limitations.**
+
+* The search returns only a limited, recent sample (the latest posts for each keyword, about one week), not all posts on the topic, so the results describe this sample only.
+* Keywords can match posts that are not really about the topic (for example posts that only use the word "art" or "education"), and some posts come from bots or are repeated templates.
+* Bluesky users are not representative of the general population.
+* Like counts depend on how long a post has been online, and the results change each time the search is run, which is why we saved the data.
+* The API limits how many follows can be collected, so the follow network is only a small part of Bluesky.
+
+# Text Analysis
+
+## Cleaning the data
+
+Before analysing the text we remove missing and unsuitable records: posts with missing text (missing likes are set to 0), posts returned by both searches (they cannot be assigned to one area), repeated posts and duplicated texts (reposts and bots, which would inflate some words), and posts containing explicit adult terms, which are not relevant to our topic.
+
+```{r clean}
+# filters and replace n/a values with 0
+posts = posts[!is.na(posts$text), ]
+posts$likes[is.na(posts$likes)] = 0
+
+# remove posts that appear in both categories and duplicated texts
+posts = posts[!(posts$uri %in% posts$uri[duplicated(posts$uri)]), ]
+posts = posts[!duplicated(posts$text), ]
+
+# remove explicit adult content (we don't need it for this investigation)
+explicit = c("nsfw", "porn", "nude", "nudes", "naked", "hentai", "xxx", "erotic",
+             "fetish", "onlyfans", "sexy")
+before = nrow(posts)
+posts = posts[!grepl(paste0("\\b(", paste(explicit, collapse = "|"), ")\\b"),
+                     tolower(posts$text)), ]
+before - nrow(posts)       # how many posts were removed
+
+# verify after cleaning 
+dim(posts)
+table(posts$area)
+```
+
+The missing-value, overlap and duplicate steps removed 144 posts (2,186 to 2,042) and the explicit-content filter removed another 145, leaving **1,897 posts** (1,011 Education and 886 Creative). The two areas are fairly balanced, so comparing them is reasonable.
+
+## Preparing the text
+
+To analyse the posts as numbers we remove links and @mentions, convert to lower case, and remove stop words, punctuation, numbers and extra whitespace. We also remove "ai" (it is in almost every post), a few swear words, and spam words ("nowplaying", "released", "hashtags", "trending") that come from automated posts. Very rare words (in fewer than about 0.2% of posts) are dropped with `removeSparseTerms()` to keep the matrix manageable.
+
+The text is then represented as a post-by-word matrix in two forms: raw word counts (`counts`) and TF-IDF weights (`weighted`). TF-IDF gives a word a high score when it is frequent in a post but rare across the other posts, so distinctive words matter more than everyday ones. In both matrices the rows are posts and the columns are words.
+
+```{r corpus}
+text = gsub("https?://\\S+", " ", posts$text)   # remove links
+text = gsub("@\\S+", " ", text)                 # remove @ mentions
+
+corpus = Corpus(VectorSource(text))             # converts clean vectors into text mining corpus
+corpus = tm_map(corpus, content_transformer(function(x) iconv(x, to = "ASCII", sub = " ")))
+corpus = tm_map(corpus, content_transformer(tolower))
+corpus = tm_map(corpus, removeWords, c(stopwords("english"), "ai", "amp", "just", "like",
+                                       "shit", "fuck", "fucking", "fucked", "damn", 
+                                       "nowplaying", "released", "hashtags", "trending")) # ai is already in every post
+corpus = tm_map(corpus, removePunctuation)
+corpus = tm_map(corpus, removeNumbers)
+corpus = tm_map(corpus, stripWhitespace)
+
+tdm = removeSparseTerms(TermDocumentMatrix(corpus), 0.998)   # remove very rare words (0.2% chance ones)
+counts = t(as.matrix(tdm))                  # turns R object into matrix
+weighted = t(as.matrix(weightTfIdf(tdm)))   # t() changes tdm to dtm afterwards
+                                            # TFIDF has to be in tdm, TFIDF weights (used for clustering)
+  
+# remove posts with no words left
+keep = rowSums(counts) > 0
+counts = counts[keep, ]
+weighted = weighted[keep, ]
+posts = posts[keep, ]
+dim(counts)
+```
+
+After removing 42 posts that had no words left, **1,855 posts and 1,708 words** remain. Most entries in the matrix are zero, because each post contains only a few of the 1,708 words.
+
+## Frequent words
+
+The table lists the 20 most frequent words by raw count. The word clouds further below show the words with the highest total TF-IDF weight in each area, so they highlight words that are distinctive and not just frequent.
+
+```{r words}
+freq = colSums(counts)
+o = order(freq, decreasing = TRUE)[1:20]
+data.frame(word = colnames(counts)[o], count = freq[o])
+```
+
+The most frequent words overall are "art" (888) and "education" (807). These are our search words, so they are at the top by design. After them come general words ("can", "use", "people", "will") and topic words such as "aiart" (117), "students" (113), "technology" (113), "learning" (103) and "literacy" (86).
+
+The word clouds compare the two areas side by side (Education on the left, Creative on the right).
+
+```{r wordclouds, fig.width=10, fig.height=5}
+edu_weights = colSums(weighted[posts$area == "Education", ])
+art_weights = colSums(weighted[posts$area == "Creative", ])
+
+par(mfrow = c(1, 2)) # for side by side comparison
+wordcloud(names(edu_weights),
+          freq = edu_weights,
+          min.freq = 0.05,
+          max.words = 100,
+          random.order = FALSE,
+          colors = brewer.pal(8, "Dark2"),
+          scale = c(2.5, 0.5)
+)
+wordcloud(names(art_weights),
+          freq = art_weights,
+          min.freq = 0.05,
+          max.words = 100,
+          random.order = FALSE,
+          colors = brewer.pal(8, "Dark2"),
+          scale = c(2.5, 0.5)
+)
+par(mfrow = c(1, 1)) # turning the plot back to normal
+```
+
+**Interpretation.** Apart from the search words, the two areas talk about AI in different ways. **Education** posts are about students, schools, universities, teachers, learning, literacy and research ("students", "school", "higher", "learning", "literacy", "educators"), and also about ethics, philosophy, cognition and memory. **Creative** posts are about making and sharing art ("aiart", "digitalart", "synthart", "generated", "make", "artists", "music", "illustration"). Words that appear almost only in one cloud are "aiart", "synthart", "digitalart" and "aiartcommunity" (Creative) and "literacy", "cognition", "philosophy" and "teachers" (Education).
+
+The Creative cloud also contains "slop", a word used to criticise AI-generated content, and the Education cloud does not show an obviously negative word of this kind. Many Creative words are hashtags (for example "tensorhubartmodels" and "aibeauty"), which suggests that part of this area is promotional or automated posting. The Education cloud contains a link fragment ("wwwpropublicaorgarticlealph") that our link-removal step did not catch, because the link has no "https". This difference in tone is what the hypothesis test examines next.
+
+# Hypothesis Test
+
+The word clouds suggest that Creative posts are more critical of AI, so we test this formally. We label a post as *critical* if it contains a word from a simple list of words people use to complain about AI (for example "steal", "cheat", "slop", "copyright" and "plagiar"). Both variables (area, and critical or not) are categories and we are comparing counts across two groups, so we use a **chi-squared test of independence**. It tests whether the share of critical posts is the same in both areas, or differs by more than chance would explain.
+
+```{r critical}
+bad = c("steal", "stole", "theft", "scrap", "plagiar", "cheat", "slop", "unethic",
+        "harm", "ban", "ruin", "destroy", "lazy", "exploit", "copyright", "consent",
+        "fake", "dishonest", "hate", "garbage")   # list of critical words
+
+# combines the word list, adds word boundaries for a perfect match, and marks posts that contain any critical word
+posts$critical = grepl(paste0("\\b(", paste(bad, collapse = "|"), ")"), tolower(posts$text)) 
+  
+tab = table(Area = posts$area, Critical = posts$critical)
+tab
+round(prop.table(tab, 1), 3) # converts raw counts into proportions
+```
+
+Of the 865 Creative posts, 123 (14.2%) are critical, compared with 72 of the 990 Education posts (7.3%).
+
+* H0: there is no connection between the topic area and being critical
+* HA: there is a connection between the topic area and being critical
+* Significance level: 0.05.
+
+We use `simulate.p.value = TRUE`, which estimates the p-value 
+
+```{r chisq}
+ct = chisq.test(tab, simulate.p.value = TRUE)
+ct$expected
+ct
+ct$p.value
+```
+
+**Conclusion.** The chi-squared statistic is 23.68 and the simulated p-value is 0.0005. This is the smallest value that 2000 simulations can give, so we report p < 0.001. It is far below 0.05, so we **reject H0**: whether a post is critical is associated with its area. Creative posts are about twice as likely to be critical (14.2%) as Education posts (7.3%). All expected counts are well above 5 (the smallest is 90.9), so the test is reliable. In the context of our investigation, critical language is clearly more common in Creative posts, which matches the word "slop" in the Creative word cloud.
+
+**Limitations of this test.** The word list is simple, misses sarcasm and measures criticism words, not true opinion. Words are matched from the start of a word, so "ban" also matches "bank" or "band" and "harm" matches "harmony", which can add some false positives. Posts from the same account, or from bots, are not fully independent. A significant result shows an association in this sample; it does not show why, or that creative users oppose AI in general. Next we check whether these differences appear as themes in the posts.
+
+# Clustering
+
+We ask whether the posts form natural groups, and whether these groups follow the two areas or the critical tone.
+
+**Choices and reasons.**
+
+* **Representation:** TF-IDF vectors, so that distinctive words matter more than everyday words.
+* **Distance:** **cosine distance**, because posts have different lengths and cosine compares which words are used rather than how many.
+* **Method:** k-means (Module 6). K-means only works with Euclidean distance, so we convert the cosine distances to coordinates with multidimensional scaling (MDS). We keep 50 dimensions so little information is lost; a separate 2-dimension version is used only for plotting.
+* **Sample:** a balanced random sample of 300 posts per area (600 in total), so that neither area dominates and the distance calculation stays fast.
+* **Number of clusters:** chosen with the elbow method (below).
+
+```{r cluster-prep}
+set.seed(3020) # for same results in every run
+# randomly picks out 300 posts each for balanced sample
+n = min(300, table(posts$area))
+rows = c(sample(which(posts$area == "Education"), n),
+         sample(which(posts$area == "Creative"), n))
+W = weighted[rows, ]
+sample_posts = posts[rows, ]
+
+norm.W = diag(1 / sqrt(rowSums(W^2))) %*% W      # convert Euclidean into cosine distance
+D = dist(norm.W, method = "euclidean")^2/2       # computes pairwise cosine distances
+mds = cmdscale(D, k = 50)                        # reduced to 50 Ds for clustering
+```
+
+## Number of clusters (elbow method)
+
+We run k-means with 20 random starts (`nstart = 20`) for k = 1 to 10 and plot the total within-cluster sum of squares (SSW). SSW always falls as clusters are added, so we look for the "elbow" where the fall slows down.
+
+```{r elbow}
+set.seed(3020)
+SSW = rep(0, 10)
+for (k in 1:10) {
+  SSW[k] = kmeans(mds, k, nstart = 20)$tot.withinss
+}
+plot(1:10, SSW, type = "b", xlab = "Number of clusters", ylab = "SSW")
+```
+
+The curve falls steadily from about 110 at k = 1 to about 84 at k = 10 and has **no sharp elbow**; the only slight bend is around k = 4. We therefore chose **k = 4**, which gives more structure than the two areas alone while keeping the clusters easy to interpret. Because the curve is so smooth, moving from one to four clusters reduces SSW by only about 13%, so the clusters are weak: the posts do not split into clearly distinct groups.
+
+```{r kmeans}
+set.seed(3020)
+k = 4
+K = kmeans(mds, k, nstart = 20)
+table(K$cluster)
+
+mds2 = cmdscale(D, k = 2)         # only 2 dimensions for plotting 
+plot(mds2, col = K$cluster, pch = 16, xlab = "MDS 1", ylab = "MDS 2",
+     main = "Clusters")
+```
+
+The plot shows the posts in two MDS dimensions, coloured by cluster (black = 1, red = 2, green = 3, blue = 4). Cluster 2 (red) is a small, very tight group far from the rest, and cluster 1 (black) is a small group stretching to the upper left. Clusters 3 (green) and 4 (blue) are large and overlap heavily at the bottom, so the boundary between the two biggest groups is blurry. Some overlap is expected, because this plot squeezes 50 dimensions into 2.
+
+## What do the clusters mean?
+
+To go beyond the cluster labels, we compare the clusters with the area of each post, with the share of critical posts (from the hypothesis test), and with their top TF-IDF words.
+
+```{r cluster-check}
+table(Cluster = K$cluster, Area = sample_posts$area)             # match the areas?
+round(tapply(sample_posts$critical, K$cluster, mean), 2)         # share of critical posts
+
+for (i in 1:k) {
+  avg = colMeans(W[K$cluster == i, , drop = FALSE])      # average TF-IDF of each word
+  cat("Cluster", i, ":", names(sort(avg, decreasing = TRUE))[1:10], "\n")
+}
+```
+
+**Cluster summary.**
+
+| Cluster | Theme (top words) | Posts | Mostly | Critical |
+|---|---|---|---|---|
+| 1 | AI art hashtags (aiart, synthart, digitalart, aibeauty) | 42 | Creative (41) | 2% |
+| 2 | Philosophy and literature (cognition, coherence, philosophy, literature, ethics) | 16 | Education (16) | 0% |
+| 3 | Schools and students (education, students, campus, school, higher) | 291 | Education (270) | 6% |
+| 4 | Artists and generated art (art, artists, generated, fan, make) | 251 | Creative (238) | 16% |
+
+In total 565 of the 600 posts (94%) sit in a cluster that matches their area, so at first sight the clusters follow the two areas. This agreement is partly built in: "education" and "art" are our search words, and they are the top TF-IDF words of clusters 3 and 4, so they strongly pull posts towards their area. The clusters therefore mostly confirm the area labels and show only weak extra structure within an area, which is consistent with the weak elbow.
+
+Critical posts do not form their own cluster. The share of critical posts is highest in cluster 4 (16%), the large Creative cluster, and lowest in the Education clusters (0% and 6%). This agrees with the hypothesis test: criticism is more common in Creative posts, but it runs through a general conversation about art and is not a separate theme.
+
+Cluster 2 is a small, tight group of 16 Education posts with an essay-like vocabulary. It is far from the other posts in the plot, which suggests a small group of near-identical (probably repeated or automated) posts rather than a real theme. Clusters 1 and 3 are partly driven by hashtags and a repeated article link (the ProPublica link, "wwwpropublicaorgarticlealph", is a top word of cluster 3). The next analysis looks at the accounts behind these conversations.
+
+# Network Analysis
+
+We build a network from follow relationships, using the friends-of-friends method of Module 7. **Nodes** are Bluesky accounts. An **edge** from A to B means A **follows** B. The network is **directed**, because following is not necessarily mutual (A can follow B without B following A).
+
+In each area the *seed user* is the account with the most followers among the 20 most-liked authors of that area's posts, so the network starts from our text data. We collect about 30 accounts the seed follows (its friends), then about 30 accounts that each friend follows (friends of friends), using `get_user_info()` and `get_follows()`. The API sometimes returned more than the limit, so these numbers are approximate. The follow data is saved so that the API is not called again when knitting.
+
+```{r seeds}
+# the author with the most followers among the 20 most-liked authors in an area
+find_seed = function(area_name) {
+  s = posts[posts$area == area_name, ]
+  likes.by.author = sort(tapply(s$likes, s$handle, sum), decreasing = TRUE)
+  info = get_user_info(names(likes.by.author)[1:20])
+  info$actor_handle[which.max(info$followers_count)]
+}
+
+# friends-of-friends edge list for one seed 
+get_network = function(seed) {
+  friends = get_follows(seed, limit = 30)$actor_handle
+  more = lapply(friends, get_follows, limit = 30)
+  more = lapply(more, `[[`, "actor_handle")
+  el_seed = cbind(from = rep(seed, length(friends)), to = friends)
+  el_friends = lapply(seq_along(friends), function(i) {
+    cbind(from = rep(friends[i], length(more[[i]])), to = more[[i]])
+  })
+  unique(rbind(el_seed, do.call(rbind, el_friends)))
+}
+
+# saved so API is not called anymore
+if (file.exists("network_edges.RData")) {
+  load("network_edges.RData")
+} else {
+  seed_edu = find_seed("Education")
+  seed_art = find_seed("Creative")
+  el_edu = get_network(seed_edu)
+  el_art = get_network(seed_art)
+  save(seed_edu, seed_art, el_edu, el_art, file = "network_edges.RData")
+}
+c(seed_edu, seed_art)
+
+el = unique(rbind(el_edu, el_art))
+el = el[el[, "from"] != el[, "to"], , drop = FALSE]   # remove self-follows
+dim(el)
+head(el)
+```
+
+The seeds are **propublica.org** (Education) and **stealthnachos.bsky.social** (Creative). The edge list has 1,947 follow links. propublica.org is a news organisation, so the Education network starts from a news account and not from an educator; this is a consequence of choosing the most-followed account among the most-liked authors.
+
+```{r graph}
+g = graph_from_edgelist(el, directed = TRUE)
+
+# color: reached from the Education seed, the Creative seed, or both
+in_edu = V(g)$name %in% c(el_edu)
+in_art = V(g)$name %in% c(el_art)
+V(g)$colour = ifelse(in_edu & in_art, "gold", ifelse(in_edu, "steelblue", "tomato"))
+
+vcount(g)                         # number of nodes
+ecount(g)                         # number of edges
+round(edge_density(g), 4)         # density
+comp = components(g, mode = "weak")
+comp$no                           # number of separate parts
+max(comp$csize)                   # size of the largest part
+sum(in_edu & in_art)              # accounts reached from both seeds
+```
+
+**Network properties.** The network has **1,844 nodes** and **1,947 edges**. The density is 0.0006, which is very sparse: only a tiny fraction of the possible links exist, as expected for a social network sampled around two seeds. The graph has **one weakly connected component** containing all 1,844 accounts, but only because the two areas share **2 accounts** (bsky.app and dieworkwear.bsky.social, shown in gold). Without them the two seeds' networks would be separate. Accounts are coloured by the seed network they were reached from: blue for Education, red for Creative and gold for both.
+
+```{r degree-dist}
+plot(degree_distribution(g), type = "h", xlab = "Degree", ylab = "Proportion",
+     main = "Degree distribution")
+```
+
+The degree distribution is extremely right-skewed: the tall bar holds about 93% of the accounts, and only a few accounts have a degree of around 30 to 60. (`degree_distribution()` starts at degree 0, so this plot is shifted by one and the tall bar, drawn at 2, is degree 1.) Most accounts are "leaves" that we reached through exactly one follow, and a few hubs have many links. This looks more like a Barabasi-Albert network (a few hubs) than a random Erdos-Renyi network, where degrees would cluster around an average. However, this shape comes largely from how we collected the data (a seed, its friends and their friends), not from natural preferential attachment.
+
+```{r plot-full, fig.height=6.5}
+set.seed(3020)
+plot(g, layout = layout_with_fr(g), vertex.color = V(g)$colour, vertex.size = 4,
+     vertex.label = NA, edge.arrow.size = 0.15, main = "Full network")
+legend("bottomleft", c("Education seed", "Creative seed", "Both"),
+       col = c("steelblue", "tomato", "gold"), pch = 16, bty = "n")
+```
+
+The full network plot uses a force-directed layout (Fruchterman-Reingold) and colours each account by its seed network. It shows two large clumps, one per seed, joined by very few links. Some red points appear inside the blue region; this is only the layout, and the real overlap is the 2 shared (gold) accounts. Labels are left out because 1,844 labels would be unreadable.
+
+The full network is too crowded to read, so we also plot a subgraph
+of accounts with more than one connection (the seeds, their friends and shared
+friends of friends). Centrality is calculated on the full graph.
+We keep these accounts because they hold the structure of the network, and removing the accounts with a single connection removes the many "leaves" that only clutter the plot.
+
+```{r plot-sub, fig.height=7}
+set.seed(3020)
+g2 = induced_subgraph(g, V(g)[degree(g) > 1])       # raise 1 if still too crowded
+plot(g2, layout = layout_with_kk(g2), vertex.color = V(g2)$colour, vertex.size = 7,
+     vertex.label = ifelse(V(g2)$name %in% c(seed_edu, seed_art), V(g2)$name, NA),
+     vertex.label.cex = 0.6, edge.arrow.size = 0.2, main = "Well-connected accounts")
+```
+
+The subgraph shows the structure clearly. Each seed is a hub surrounded by its friends, and the two gold accounts are the only bridges between the Education (blue) group and the Creative (red) group. Colour shows the seed network, and labels are limited to the two seeds to avoid clutter.
+
+## Important accounts
+
+We use three centrality measures. **Degree** is the number of links an account has. **Closeness** is how near an account is, on average, to all other accounts. **Betweenness** is how often an account lies on the shortest paths between other accounts, so how much it acts as a bridge. For all three, a higher score means a more central account.
+
+```{r centrality}
+head(sort(degree(g), decreasing = TRUE), 5)
+round(head(sort(closeness(g, mode = "all"), decreasing = TRUE), 5), 4)
+round(head(sort(betweenness(g, directed = TRUE), decreasing = TRUE), 5), 4)
+```
+
+**Interpretation.**
+
+* **Degree:** the highest degrees are 1ndefference.bsky.social (61), then chicagotribune.com, halleparker.bsky.social, byaaroncdavis.bsky.social and catebrown.bsky.social (60 each). These are friends of the seeds, not the seeds themselves. Their degree is high only because we collected their follow lists (about 60 accounts each), so it reflects our data collection and not real popularity.
+* **Closeness:** all accounts have almost the same tiny closeness (about 0.0001 to 0.0002), because the network is large and sparse. The highest is stealthnachos.bsky.social (0.0002). The next accounts (duckaislop.bsky.social, gojirra.bsky.social, bsky.app and dieworkwear.bsky.social) tie at 0.0001 when rounded. bsky.app and dieworkwear.bsky.social are the 2 shared accounts, which sit between the two groups and so are fairly close to both.
+* **Betweenness:** propublica.org is far ahead (6,316), then stealthnachos.bsky.social (1,974), kendalltaggart.bsky.social (881), chicagotribune.com (522) and halleparker.bsky.social (502). The seeds score highest because each is the only bridge between its own friends and the accounts they follow.
+
+The three measures give different lists: degree highlights friends of the seeds, betweenness highlights the seeds, and closeness highlights the Creative seed and the shared accounts. The Education seed also links back to the text analysis: the ProPublica article link is one of the top words of Education cluster 3. The two areas share only 2 accounts out of 1,844, so in this sample the Education and Creative conversations involve almost entirely different accounts.
+
+**Network limitations.** The network is built around two seed users that we chose, so the seeds and their friends are central by design (the real links between the areas are the 2 shared accounts). The API limit meant that only about 30 follows per account were collected, so this is a tiny part of Bluesky, and different seeds or limits would give a different network. High degrees mainly reflect which follow lists we collected. Filtering to accounts with more than one connection was used only to draw the subgraph; all centrality scores use the full graph. Follow relationships say nothing about what accounts post, so the network cannot show whether accounts are critical of AI.
+
+# Overall Findings and Limitations
+
+Taken together, the four analyses show how AI is discussed on Bluesky in this sample.
+
+1. **Words:** Education posts are about students, schools, learning and literacy, while Creative posts are about making and sharing art ("aiart", "generated", "artists"). Creative posts also include "slop", a word used to criticise AI content.
+2. **Tone:** The chi-squared test rejects H0 (X-squared = 23.7, simulated p < 0.001). Creative posts contain critical words about twice as often as Education posts (14.2% vs 7.3%).
+3. **Clusters:** Four weak clusters form (the elbow has no sharp bend and SSW falls by only about 13%). About 94% of sampled posts sit in a cluster that matches their area, but this is partly because "education" and "art" are the search words. One cluster is a small group of near-identical posts. Critical posts do not form their own cluster; they are mainly in the large Creative cluster (16%).
+4. **Network:** The two follow networks are sparse (density 0.0006) and almost separate, sharing only 2 accounts. The Education network is built around a news organisation, and the seeds are central by design, so the main finding is how little the two areas overlap.
+5. **Overall:** In this sample, AI in education is discussed in terms of students, learning and literacy with fewer critical words, while AI in creative arts is discussed in terms of making and sharing art and attracts about twice as many critical words (for example "slop"). The two conversations also involve different accounts. These findings are suggestive only, because criticism is measured with keywords and the sample is small and short.
+
+**Limitations.**
+
+* **Data collection and sampling:** The data is a small, recent (about one week), keyword-based sample from Bluesky, whose users are not representative. Some posts are off-topic, and bot and templated posts remain.
+* **API restrictions:** The search is capped and sorted by latest, results change between runs, and the follow data was limited to about 30 follows per account, so the network is a small part of Bluesky.
+* **Measurement:** Our critical-word list is a rough measure of opinion. It misses sarcasm and can match parts of other words.
+* **Analytical choices:** Removing rare words, using a balanced sample of 300 posts per area, choosing k = 4 (the clusters are weak), choosing the two seeds, and the subgraph threshold all affect the results.
+* **Interpretation:** The results show associations in this sample, not causes.
